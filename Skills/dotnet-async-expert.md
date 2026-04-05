@@ -33,7 +33,20 @@ Evaluate the code against the following critical async rules:
 
 ### Step 3: Format Feedback
 
-Output a concise, structured list of findings.
+Return findings as a JSON array with this schema:
 
-- Do not write fixed code; only provide the required fix instructions for the Refactor Agent.
-- If no async issues are found, explicitly output: "ASYNC: Clean."
+[
+	{
+		"issue": "one-sentence description",
+		"severity": "critical | high | medium | low",
+		"category": "async",
+		"recommendation": "concrete fix instruction",
+		"line_range": [10, 15]
+	}
+]
+
+Rules:
+- Return raw JSON only for findings.
+- Emit multiple objects when multiple issues exist.
+- Do not write fixed code; only provide fix instructions.
+- If no async issues are found, output exactly: "ASYNC: Clean."

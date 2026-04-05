@@ -1,0 +1,829 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+import logging
+import os
+import tempfile
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+from dotenv import load_dotenv
+from openai import AsyncOpenAI, OpenAIError
+
+from analysis_state import AnalysisStateManager, make_config_signature
+from metadata_enricher import build_metadata_context, extract_repository_metadata
+from repo_ingestion import CSFileCollector, GitHubRepoFetcher, batch_files
+from results_aggregator import FileFeedback, ResultsAggregator
+
+
+GITHUB_MODELS_ENDPOINT = "https://models.github.ai/inference"
+DEFAULT_MODEL = "gpt-4.1"
+MAX_SOURCE_CHARS = 15000
+DEFAULT_MAX_CONCURRENCY = 5
+DEFAULT_ROSLYN_TIMEOUT = 300
+
+logger = logging.getLogger(__name__)
+FAILED_FEEDBACK_PREFIX = "No findings returned because this expert failed"
+SKILLS_DIR = Path(__file__).resolve().parent / "Skills"
+ROSLYN_EXTRACTOR_DIR = Path(__file__).resolve().parent / "RoslynMetadataExtractor"
+
+
+@dataclass(frozen=True)
+class ExpertAgent:
+    name: str
+    instructions: str
+
+
+@dataclass(frozen=True)
+class ExpertSkill:
+    name: str
+    skill_file: str
+
+
+EXPERT_SKILLS: tuple[ExpertSkill, ...] = (
+    ExpertSkill(name="AsyncExpert", skill_file="dotnet-async-expert.md"),
+    ExpertSkill(name="MemoryExpert", skill_file="dotnet-memory-expert.md"),
+    ExpertSkill(name="ParallelExpert", skill_file="dotnet-parallel-expert.md"),
+    ExpertSkill(name="DDDExpert", skill_file="dotnet-ddd-expert.md"),
+    ExpertSkill(name="DIExpert", skill_file="dotnet-di-expert.md"),
+    ExpertSkill(name="LayeringExpert", skill_file="dotnet-layering-expert.md"),
+)
+
+
+# Used when no repository source is provided.
+DEFAULT_MESSY_CODE = """
+public static List<int> ProcessData(string url)
+{
+    // Async deadlock: .Result blocks the calling thread
+    var httpClient = new HttpClient();
+    var response = httpClient.GetAsync(url).Result;
+    var content = response.Content.ReadAsStringAsync().Result;
+
+    // Memory leak: MemoryStream is created but never disposed
+    var stream = new MemoryStream(System.Text.Encoding.UTF8.GetBytes(content));
+    int length = (int)stream.Length;
+
+    // Race condition: List<int> is not thread-safe for concurrent writes
+    var results = new List<int>();
+    Parallel.ForEach(Enumerable.Range(0, length), i =>
+    {
+        results.Add(i * 2);
+    });
+
+    return results;
+}
+""".strip()
+
+
+@dataclass
+class AnalysisPlan:
+    files_requiring_analysis: list[Path]
+    reused_feedbacks: list[FileFeedback]
+    resumed_feedbacks: list[FileFeedback]
+    checkpoint_completed: dict[str, FileFeedback]
+    current_fingerprints: dict[str, str]
+    cache_hits: int
+    resumed_count: int
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Scatter-Gather POC: Multi-expert code analysis for .NET projects"
+    )
+
+    source_group = parser.add_mutually_exclusive_group()
+    source_group.add_argument(
+        "--repo",
+        type=str,
+        help='GitHub repo in format "owner/repo" (example: "dotnet/runtime")',
+    )
+    source_group.add_argument(
+        "--local",
+        type=Path,
+        help="Path to local .NET repository instead of cloning",
+    )
+
+    parser.add_argument(
+        "--branch",
+        type=str,
+        default="main",
+        help="Git branch to analyze (default: main)",
+    )
+    parser.add_argument(
+        "--token",
+        type=str,
+        help="GitHub token for private repos (or use GITHUB_TOKEN env var)",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("analysis_report.json"),
+        help="Output file for analysis report (default: analysis_report.json)",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=5,
+        help="Number of files per batch (default: 5)",
+    )
+    parser.add_argument(
+        "--max-files",
+        type=int,
+        default=None,
+        help="Limit analysis to first N files (useful for testing)",
+    )
+    parser.add_argument(
+        "--no-hot-path-only",
+        action="store_true",
+        help="Analyze all files (not just hot paths like Controllers/Services)",
+    )
+    parser.add_argument(
+        "--max-tokens-per-batch",
+        type=int,
+        default=None,
+        help="Cap estimated input tokens per batch (chars/4 heuristic)",
+    )
+    parser.add_argument(
+        "--max-concurrency",
+        type=int,
+        default=DEFAULT_MAX_CONCURRENCY,
+        help="Max concurrent model requests across all experts (default: 5)",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=Path(".sg_cache"),
+        help="Directory for incremental analysis state and checkpoints",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from a saved checkpoint for unfinished runs",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report projected batches and API calls without model requests",
+    )
+    parser.add_argument(
+        "--roslyn-timeout",
+        type=int,
+        default=DEFAULT_ROSLYN_TIMEOUT,
+        help="Timeout in seconds for Roslyn metadata extraction (default: 300)",
+    )
+
+    return parser.parse_args()
+
+
+def _require_token(cli_token: str | None) -> str:
+    load_dotenv()
+    token = cli_token or os.getenv("GITHUB_TOKEN")
+    if not token:
+        raise RuntimeError("GITHUB_TOKEN environment variable is not set.")
+    return token
+
+
+def _normalize_relative_path(path: str | Path) -> str:
+    return Path(path).as_posix()
+
+
+def _resolve_cache_dir(repo_root: Path, cache_dir: Path) -> Path:
+    if cache_dir.is_absolute():
+        return cache_dir
+    return (repo_root / cache_dir).resolve()
+
+
+def _build_config_signature(args: argparse.Namespace, model: str, experts: tuple[ExpertAgent, ...]) -> str:
+    config_payload = {
+        "model": model,
+        "experts": [expert.name for expert in experts],
+        "batch_size": args.batch_size,
+        "max_tokens_per_batch": args.max_tokens_per_batch,
+        "hot_path_only": not args.no_hot_path_only,
+        "max_files": args.max_files,
+        "max_source_chars": MAX_SOURCE_CHARS,
+        "schema_version": 2,
+    }
+    return make_config_signature(config_payload)
+
+
+def _strip_frontmatter(markdown_text: str) -> str:
+    lines = markdown_text.splitlines()
+    if len(lines) >= 3 and lines[0].strip() == "---":
+        for idx in range(1, len(lines)):
+            if lines[idx].strip() == "---":
+                return "\n".join(lines[idx + 1 :]).strip()
+    return markdown_text.strip()
+
+
+def load_expert_agents(skills_dir: Path = SKILLS_DIR) -> tuple[ExpertAgent, ...]:
+    agents: list[ExpertAgent] = []
+    for skill in EXPERT_SKILLS:
+        skill_path = skills_dir / skill.skill_file
+        try:
+            raw_markdown = skill_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise RuntimeError(
+                f"Failed to load skill instructions for {skill.name} from {skill_path}."
+            ) from exc
+
+        instructions = _strip_frontmatter(raw_markdown)
+        if not instructions:
+            raise RuntimeError(
+                f"Skill file for {skill.name} is empty after removing frontmatter: {skill_path}."
+            )
+
+        agents.append(ExpertAgent(name=skill.name, instructions=instructions))
+
+    return tuple(agents)
+
+
+def _truncate_source(source_code: str, file_path: Path) -> str:
+    if len(source_code) <= MAX_SOURCE_CHARS:
+        return source_code
+
+    logger.warning(
+        "%s is large (%s chars); truncating to %s chars",
+        file_path.name,
+        len(source_code),
+        MAX_SOURCE_CHARS,
+    )
+    return source_code[:MAX_SOURCE_CHARS] + "\n// ... [truncated] ..."
+
+
+async def run_agent(
+    client: AsyncOpenAI,
+    *,
+    model: str,
+    name: str,
+    instructions: str,
+    user_prompt: str,
+) -> str:
+    try:
+        response = await client.chat.completions.create(
+            model=model,
+            temperature=0,
+            messages=[
+                {"role": "system", "content": instructions},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+    except OpenAIError as exc:
+        raise RuntimeError(f"{name} failed to generate a response.") from exc
+
+    content = response.choices[0].message.content
+    return content.strip() if content else ""
+
+
+async def run_agent_throttled(
+    client: AsyncOpenAI,
+    semaphore: asyncio.Semaphore,
+    *,
+    model: str,
+    name: str,
+    instructions: str,
+    user_prompt: str,
+) -> str:
+    async with semaphore:
+        return await run_agent(
+            client,
+            model=model,
+            name=name,
+            instructions=instructions,
+            user_prompt=user_prompt,
+        )
+
+
+async def gather_feedback(
+    client: AsyncOpenAI,
+    *,
+    semaphore: asyncio.Semaphore,
+    model: str,
+    source_code: str,
+    relative_path: Path,
+    metadata_context: str,
+    experts: tuple[ExpertAgent, ...],
+) -> dict[str, str]:
+    review_prompt = (
+        f"File: {relative_path}\n\n"
+        "Repository metadata context:\n"
+        f"{metadata_context}\n\n"
+        "Review the following C# code and report your findings:\n\n"
+        f"```csharp\n{source_code}\n```"
+    )
+
+    tasks = [
+        run_agent_throttled(
+            client,
+            semaphore,
+            model=model,
+            name=expert.name,
+            instructions=expert.instructions,
+            user_prompt=review_prompt,
+        )
+        for expert in experts
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    feedback_by_agent: dict[str, str] = {}
+    for expert, result in zip(experts, results):
+        if isinstance(result, Exception):
+            logger.error("%s failed during feedback gathering: %s", expert.name, result)
+            feedback_by_agent[expert.name] = (
+                "No findings returned because this expert failed to respond."
+            )
+            continue
+        feedback_by_agent[expert.name] = result or "No findings returned."
+
+    if all(
+        feedback.startswith(FAILED_FEEDBACK_PREFIX)
+        for feedback in feedback_by_agent.values()
+    ):
+        logger.warning("All experts failed to respond for file: %s", relative_path)
+
+    return feedback_by_agent
+
+
+async def analyze_file(
+    client: AsyncOpenAI,
+    *,
+    semaphore: asyncio.Semaphore,
+    model: str,
+    file_path: Path,
+    repo_root: Path,
+    metadata_bundle: dict,
+    experts: tuple[ExpertAgent, ...],
+) -> FileFeedback:
+    try:
+        source_code = file_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        logger.warning("Could not read %s (%s); using placeholder", file_path, exc)
+        source_code = f"[File unreadable: {file_path.name}]"
+
+    source_code = _truncate_source(source_code, file_path)
+
+    try:
+        relative_path = file_path.relative_to(repo_root)
+    except ValueError:
+        relative_path = file_path
+
+    metadata_context = build_metadata_context(
+        file_path=file_path,
+        repo_root=repo_root,
+        metadata_bundle=metadata_bundle,
+    )
+
+    feedback_by_agent = await gather_feedback(
+        client,
+        semaphore=semaphore,
+        model=model,
+        source_code=source_code,
+        relative_path=relative_path,
+        metadata_context=metadata_context,
+        experts=experts,
+    )
+
+    return ResultsAggregator.create_file_feedback(file_path, repo_root, feedback_by_agent)
+
+
+async def analyze_batch(
+    client: AsyncOpenAI,
+    *,
+    semaphore: asyncio.Semaphore,
+    model: str,
+    batch_files_list: list[Path],
+    repo_root: Path,
+    metadata_bundle: dict,
+    experts: tuple[ExpertAgent, ...],
+) -> list[FileFeedback]:
+    tasks = [
+        analyze_file(
+            client,
+            semaphore=semaphore,
+            model=model,
+            file_path=file_path,
+            repo_root=repo_root,
+            metadata_bundle=metadata_bundle,
+            experts=experts,
+        )
+        for file_path in batch_files_list
+    ]
+    return await asyncio.gather(*tasks)
+
+
+def _split_owner_repo(repo: str) -> tuple[str, str]:
+    parts = repo.strip().split("/", maxsplit=1)
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        raise ValueError(
+            f"Invalid --repo format: {repo!r}. Expected 'owner/repo'."
+        )
+    return parts[0], parts[1]
+
+
+def _print_scope(
+    repository_name: str,
+    repo_root: Path,
+    total_found: int,
+    files_to_analyze: int,
+    files_requiring_analysis: int,
+    cache_hits: int,
+    resumed_count: int,
+    metadata_status: str,
+    experts: tuple[ExpertAgent, ...],
+    max_concurrency: int,
+    output: Path,
+) -> None:
+    print(f"\n{'=' * 70}")
+    print("ANALYSIS SCOPE")
+    print(f"{'=' * 70}")
+    print(f"Repository: {repository_name}")
+    print(f"Root: {repo_root}")
+    print(f"Total C# files found: {total_found}")
+    print(f"Files to analyze: {files_to_analyze}")
+    print(f"Files requiring fresh analysis: {files_requiring_analysis}")
+    print(f"Files reused from cache: {cache_hits}")
+    print(f"Files restored from checkpoint: {resumed_count}")
+    print(f"Metadata extraction status: {metadata_status}")
+    print(f"Experts: {len(experts)} ({', '.join(e.name for e in experts)})")
+    print(f"Max concurrency: {max_concurrency}")
+    print(f"Output: {output}")
+    print(f"{'=' * 70}\n")
+
+
+def _print_dry_run(
+    repository_name: str,
+    total_found: int,
+    selected_count: int,
+    analysis_count: int,
+    batch_count: int,
+    experts: tuple[ExpertAgent, ...],
+) -> None:
+    projected_calls = analysis_count * len(experts)
+    print(f"\n{'=' * 70}")
+    print("DRY RUN")
+    print(f"{'=' * 70}")
+    print(f"Repository: {repository_name}")
+    print(f"Total C# files found: {total_found}")
+    print(f"Files selected for scope: {selected_count}")
+    print(f"Files requiring fresh analysis: {analysis_count}")
+    print(f"Batches: {batch_count}")
+    print(f"Experts: {len(experts)} ({', '.join(e.name for e in experts)})")
+    print(f"Projected model calls: {projected_calls}")
+    print("No model requests were made.")
+    print(f"{'=' * 70}\n")
+
+
+def _plan_analysis(
+    *,
+    files_to_analyze: list[Path],
+    state_manager: Optional[AnalysisStateManager],
+    config_signature: str,
+    resume_enabled: bool,
+) -> AnalysisPlan:
+    if state_manager is None:
+        return AnalysisPlan(
+            files_requiring_analysis=list(files_to_analyze),
+            reused_feedbacks=[],
+            resumed_feedbacks=[],
+            checkpoint_completed={},
+            current_fingerprints={},
+            cache_hits=0,
+            resumed_count=0,
+        )
+
+    state_payload = state_manager.load_state()
+    state_matches = state_payload.get("config_signature") == config_signature
+
+    current_fingerprints = state_manager.compute_fingerprints(files_to_analyze)
+    previous_fingerprints: dict[str, str] = {}
+    cached_feedbacks: dict[str, FileFeedback] = {}
+    changed_by_git: Optional[set[str]] = None
+
+    if state_matches:
+        raw_previous = state_payload.get("file_fingerprints", {})
+        if isinstance(raw_previous, dict):
+            previous_fingerprints = {
+                _normalize_relative_path(path): str(fp)
+                for path, fp in raw_previous.items()
+                if isinstance(fp, str)
+            }
+
+        cached_feedbacks = state_manager.deserialize_cached_feedbacks(state_payload)
+        changed_by_git = state_manager.changed_files_from_git(
+            state_payload.get("last_analyzed_commit")
+        )
+
+    reused_feedbacks: list[FileFeedback] = []
+    files_requiring_analysis: list[Path] = []
+
+    for file_path in files_to_analyze:
+        relative_path = state_manager.to_relative_path(file_path)
+        cached_feedback = cached_feedbacks.get(relative_path)
+        current_fingerprint = current_fingerprints.get(relative_path)
+        previous_fingerprint = previous_fingerprints.get(relative_path)
+
+        unchanged = (
+            cached_feedback is not None
+            and current_fingerprint is not None
+            and previous_fingerprint is not None
+            and current_fingerprint == previous_fingerprint
+        )
+
+        if unchanged and changed_by_git is not None and relative_path in changed_by_git:
+            unchanged = False
+
+        if unchanged and cached_feedback is not None:
+            reused_feedbacks.append(cached_feedback)
+        else:
+            files_requiring_analysis.append(file_path)
+
+    resumed_feedbacks: list[FileFeedback] = []
+    checkpoint_completed: dict[str, FileFeedback] = {}
+
+    if resume_enabled:
+        checkpoint_payload = state_manager.load_checkpoint()
+        if checkpoint_payload and checkpoint_payload.get("config_signature") == config_signature:
+            checkpoint_completed = state_manager.deserialize_checkpoint_feedbacks(checkpoint_payload)
+
+            remaining_files: list[Path] = []
+            for file_path in files_requiring_analysis:
+                relative_path = state_manager.to_relative_path(file_path)
+                completed_feedback = checkpoint_completed.get(relative_path)
+                if completed_feedback is not None:
+                    resumed_feedbacks.append(completed_feedback)
+                else:
+                    remaining_files.append(file_path)
+
+            files_requiring_analysis = remaining_files
+
+    return AnalysisPlan(
+        files_requiring_analysis=files_requiring_analysis,
+        reused_feedbacks=reused_feedbacks,
+        resumed_feedbacks=resumed_feedbacks,
+        checkpoint_completed=checkpoint_completed,
+        current_fingerprints=current_fingerprints,
+        cache_hits=len(reused_feedbacks),
+        resumed_count=len(resumed_feedbacks),
+    )
+
+
+def _print_batch_summary(batch_feedbacks: list[FileFeedback]) -> None:
+    total_findings = sum(len(fb.findings) for fb in batch_feedbacks)
+    critical_count = sum(
+        1 for fb in batch_feedbacks for finding in fb.findings if finding.severity == "critical"
+    )
+    print(f"  Batch complete: {total_findings} findings ({critical_count} critical)")
+
+
+def _print_top_critical_issues(file_feedbacks: list[FileFeedback], limit: int = 5) -> None:
+    critical_findings = [
+        (feedback.relative_path, finding)
+        for feedback in file_feedbacks
+        for finding in feedback.findings
+        if finding.severity == "critical"
+    ]
+
+    if not critical_findings:
+        return
+
+    print("\nTOP CRITICAL ISSUES:")
+    print("=" * 70)
+    for relative_path, finding in critical_findings[:limit]:
+        print(f"\n{relative_path}")
+        print(f"  Expert: {finding.expert}")
+        print(f"  Issue: {finding.issue}")
+        print(f"  Recommendation: {finding.recommendation}")
+
+    remaining = len(critical_findings) - limit
+    if remaining > 0:
+        print(f"\n... and {remaining} more critical issues")
+
+
+async def main() -> None:
+    args = parse_args()
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be greater than 0.")
+    if args.max_concurrency <= 0:
+        raise ValueError("--max-concurrency must be greater than 0.")
+    if args.max_tokens_per_batch is not None and args.max_tokens_per_batch <= 0:
+        raise ValueError("--max-tokens-per-batch must be greater than 0 when provided.")
+    if args.roslyn_timeout <= 0:
+        raise ValueError("--roslyn-timeout must be greater than 0.")
+
+    load_dotenv()
+    github_token = args.token or os.getenv("GITHUB_TOKEN")
+    model = os.getenv("GITHUB_MODEL", DEFAULT_MODEL)
+    experts = load_expert_agents()
+    config_signature = _build_config_signature(args, model=model, experts=experts)
+
+    temp_context: Optional[tempfile.TemporaryDirectory] = None
+
+    try:
+        source_mode = "default"
+        if args.repo:
+            owner, repo = _split_owner_repo(args.repo)
+            repo_root = GitHubRepoFetcher.clone_repo(
+                owner=owner,
+                repo=repo,
+                branch=args.branch,
+                token=github_token,
+            )
+            repository_name = f"{owner}/{repo}"
+            all_cs_files = CSFileCollector.collect(repo_root)
+            source_mode = "repo"
+        elif args.local:
+            repo_root = GitHubRepoFetcher.from_local_path(args.local)
+            repository_name = repo_root.name
+            all_cs_files = CSFileCollector.collect(repo_root)
+            source_mode = "local"
+        else:
+            temp_context = tempfile.TemporaryDirectory(prefix="scatter_gather_default_")
+            repo_root = Path(temp_context.name)
+            test_file = repo_root / "DefaultSnippet.cs"
+            test_file.write_text(DEFAULT_MESSY_CODE, encoding="utf-8")
+            repository_name = "default-test-code"
+            all_cs_files = [test_file]
+
+        files_to_analyze = list(all_cs_files)
+        if not args.no_hot_path_only and (args.repo or args.local):
+            files_to_analyze = CSFileCollector.prioritize_hot_paths(files_to_analyze)
+
+        if args.max_files is not None:
+            files_to_analyze = files_to_analyze[: args.max_files]
+
+        if not files_to_analyze:
+            raise RuntimeError("No C# files found to analyze with the selected options.")
+
+        state_manager: Optional[AnalysisStateManager] = None
+        if source_mode in {"repo", "local"}:
+            state_manager = AnalysisStateManager(
+                repo_root=repo_root,
+                cache_dir=_resolve_cache_dir(repo_root, args.cache_dir),
+            )
+
+        plan = _plan_analysis(
+            files_to_analyze=files_to_analyze,
+            state_manager=state_manager,
+            config_signature=config_signature,
+            resume_enabled=args.resume,
+        )
+
+        batches_to_run = batch_files(
+            plan.files_requiring_analysis,
+            batch_size=args.batch_size,
+            max_tokens_per_batch=args.max_tokens_per_batch,
+        )
+
+        if args.dry_run:
+            _print_dry_run(
+                repository_name=repository_name,
+                total_found=len(all_cs_files),
+                selected_count=len(files_to_analyze),
+                analysis_count=len(plan.files_requiring_analysis),
+                batch_count=len(batches_to_run),
+                experts=experts,
+            )
+            return
+
+        github_token = _require_token(args.token)
+        client = AsyncOpenAI(api_key=github_token, base_url=GITHUB_MODELS_ENDPOINT)
+
+        metadata_bundle = extract_repository_metadata(
+            repo_root=repo_root,
+            files=files_to_analyze,
+            extractor_project=ROSLYN_EXTRACTOR_DIR,
+            timeout_seconds=args.roslyn_timeout,
+        )
+        metadata_status = str(metadata_bundle.get("metadata_extraction_status") or "none")
+
+        _print_scope(
+            repository_name=repository_name,
+            repo_root=repo_root,
+            total_found=len(all_cs_files),
+            files_to_analyze=len(files_to_analyze),
+            files_requiring_analysis=len(plan.files_requiring_analysis),
+            cache_hits=plan.cache_hits,
+            resumed_count=plan.resumed_count,
+            metadata_status=metadata_status,
+            experts=experts,
+            max_concurrency=args.max_concurrency,
+            output=args.output,
+        )
+
+        semaphore = asyncio.Semaphore(args.max_concurrency)
+
+        all_file_feedbacks: list[FileFeedback] = []
+        all_file_feedbacks.extend(plan.reused_feedbacks)
+        all_file_feedbacks.extend(plan.resumed_feedbacks)
+
+        checkpoint_completed = dict(plan.checkpoint_completed)
+        pending_paths = {
+            state_manager.to_relative_path(file_path): file_path
+            for file_path in plan.files_requiring_analysis
+        } if state_manager is not None else {}
+
+        fresh_feedbacks: list[FileFeedback] = []
+
+        for batch_index, file_batch in enumerate(batches_to_run, start=1):
+            print(
+                f"[Batch {batch_index}/{len(batches_to_run)}] "
+                f"Analyzing {len(file_batch)} files..."
+            )
+            batch_feedbacks = await analyze_batch(
+                client,
+                semaphore=semaphore,
+                model=model,
+                batch_files_list=file_batch,
+                repo_root=repo_root,
+                metadata_bundle=metadata_bundle,
+                experts=experts,
+            )
+
+            fresh_feedbacks.extend(batch_feedbacks)
+            all_file_feedbacks.extend(batch_feedbacks)
+            _print_batch_summary(batch_feedbacks)
+
+            if args.resume and state_manager is not None:
+                for feedback in batch_feedbacks:
+                    relative_path = _normalize_relative_path(feedback.relative_path)
+                    checkpoint_completed[relative_path] = feedback
+                    pending_paths.pop(relative_path, None)
+
+                state_manager.save_checkpoint(
+                    config_signature=config_signature,
+                    completed_feedbacks=checkpoint_completed,
+                    pending_paths=sorted(pending_paths.keys()),
+                )
+
+        print(f"\nAggregating findings from {len(all_file_feedbacks)} files...")
+
+        merged_feedbacks = ResultsAggregator.merge_feedbacks(all_file_feedbacks)
+        report = ResultsAggregator.aggregate_findings(merged_feedbacks)
+        report.repository_name = repository_name
+        report.analyzed_at = datetime.now().isoformat()
+        report.scope = {
+            "repository": repository_name,
+            "root": str(repo_root),
+            "total_files_found": len(all_cs_files),
+            "files_analyzed": len(files_to_analyze),
+            "batch_size": args.batch_size,
+            "max_tokens_per_batch": args.max_tokens_per_batch,
+            "max_concurrency": args.max_concurrency,
+            "hot_path_only": not args.no_hot_path_only,
+            "branch": args.branch,
+            "cache_dir": str(state_manager.cache_dir) if state_manager is not None else None,
+            "resume_enabled": args.resume,
+            "metadata_extraction_status": metadata_status,
+            "metadata_errors": metadata_bundle.get("errors", []),
+            "config_signature": config_signature,
+        }
+
+        report.summary_metrics.update(
+            {
+                "cache_hits": plan.cache_hits,
+                "resumed_count": plan.resumed_count,
+                "files_analyzed_fresh": len(fresh_feedbacks),
+                "files_reused": plan.cache_hits + plan.resumed_count,
+            }
+        )
+
+        ResultsAggregator.save_report(report, args.output)
+        print("\n" + ResultsAggregator.print_summary(report))
+        _print_top_critical_issues(report.file_feedbacks)
+
+        if state_manager is not None:
+            cached_feedbacks = {
+                _normalize_relative_path(feedback.relative_path): feedback
+                for feedback in report.file_feedbacks
+            }
+            state_manager.save_state(
+                config_signature=config_signature,
+                last_analyzed_commit=state_manager.current_commit_sha(),
+                file_fingerprints=plan.current_fingerprints,
+                cached_feedbacks=cached_feedbacks,
+            )
+
+            if args.resume:
+                state_manager.clear_checkpoint()
+    finally:
+        if temp_context is not None:
+            temp_context.cleanup()
+
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
+
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nAnalysis interrupted by user.")
+        raise SystemExit(0) from None
+    except Exception as exc:
+        logger.error("Fatal error: %s", exc, exc_info=True)
+        raise SystemExit(f"Error: {exc}") from exc

@@ -215,3 +215,10 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 .env
+
+# Scatter-gather runtime cache/state
+.sg_cache/
+
+# Roslyn helper build artifacts
+RoslynMetadataExtractor/bin/
+RoslynMetadataExtractor/obj/

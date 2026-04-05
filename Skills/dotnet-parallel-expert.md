@@ -27,6 +27,20 @@ Evaluate the code against the following critical thread-safety rules:
 3. **Race Conditions:** Look for check-then-act operations that are not atomic (e.g., checking if a key exists in a dictionary, then adding it, without a lock or `GetOrAdd`).
 
 ### Step 3: Format Feedback
-Output a concise, structured list of findings. 
-- Do not write fixed code; only provide the required fix instructions for the Refactor Agent.
-- If no parallel issues are found, explicitly output: "PARALLEL: Clean."
+Return findings as a JSON array with this schema:
+
+[
+	{
+		"issue": "one-sentence description",
+		"severity": "critical | high | medium | low",
+		"category": "parallel",
+		"recommendation": "concrete fix instruction",
+		"line_range": [10, 15]
+	}
+]
+
+Rules:
+- Return raw JSON only for findings.
+- Emit multiple objects when multiple issues exist.
+- Do not write fixed code; only provide fix instructions.
+- If no parallel issues are found, output exactly: "PARALLEL: Clean."

@@ -1,6 +1,6 @@
 # Scatter-Gather POC: Multi-Expert Repository Analysis
 
-**Phase 1: Repository Foundation** - ⚠️ PARTIAL (modules complete, orchestrator missing)
+**Phase 1-4 Delivery Status** - ✅ CORE IMPLEMENTATION COMPLETE (validation and hardening ongoing)
 
 ## Overview
 
@@ -9,7 +9,7 @@ This tool enables automated performance and code quality analysis of large .NET 
 ### Key Capabilities
 
 - **Multi-file analysis**: Process entire .NET repositories instead of single code snippets
-- **Parallel expert evaluation**: 3+ specialized experts analyze each file concurrently
+- **Parallel expert evaluation**: 6 specialized experts analyze each file concurrently
 - **Hot-path prioritization**: Focuses on Controllers, Services, and Handler classes first
 - **Batch processing**: Efficiently handles 100+ file repositories with configurable batching
 - **Structured reporting**: JSON output with findings by severity (Critical/High/Medium/Low)
@@ -31,7 +31,7 @@ python scatter_gather_poc.py
 
 This analyzes a built-in example code snippet with intentional issues (async deadlock, memory leak, race condition).
 
-**Note**: Requires `GITHUB_TOKEN` environment variable or `--token` argument.
+**Note**: Use `--dry-run` to test configuration without `GITHUB_TOKEN`. Non-dry runs require `GITHUB_TOKEN`.
 
 ### 2. Analyze Local .NET Repository
 
@@ -82,6 +82,12 @@ python scatter_gather_poc.py \
 | `--batch-size` | int | `5` | Files per batch |
 | `--max-files` | int | - | Limit to first N files |
 | `--no-hot-path-only` | flag | - | Analyze all files (default: hot paths only) |
+| `--max-tokens-per-batch` | int | - | Cap estimated tokens per batch (chars/4 heuristic) |
+| `--max-concurrency` | int | `5` | Max concurrent expert requests |
+| `--cache-dir` | path | `.sg_cache` | State/checkpoint storage path |
+| `--resume` | flag | - | Resume from checkpoint |
+| `--dry-run` | flag | - | Print projected calls and batches without model requests |
+| `--roslyn-timeout` | int | `300` | Roslyn metadata extraction timeout (seconds) |
 
 ## Output
 
@@ -95,7 +101,7 @@ Repository: myorg/myrepo
 Root: C:\repos\myrepo
 Total C# files found: 342
 Files to analyze: 50
-Experts: 3 (AsyncExpert, MemoryExpert, ParallelExpert)
+Experts: 6 (AsyncExpert, MemoryExpert, ParallelExpert, DDDExpert, DIExpert, LayeringExpert)
 Output: analysis_report.json
 ======================================================================
 
@@ -235,14 +241,23 @@ Save JSON + print summary to console
 
 ## Expert Specialists (Current)
 
-1. **AsyncExpert** (dotnet-async-expert.md)
-   - Detects: `.Result` blocking, missing `ConfigureAwait`, deadlocks
-   
-2. **MemoryExpert** (dotnet-memory-expert.md)
-   - Detects: Undisposed resources, memory leaks, event handler leaks
-   
-3. **ParallelExpert** (dotnet-parallel-expert.md)
-   - Detects: Race conditions, thread-unsafe collections, improper locking
+1. **AsyncExpert** (`dotnet-async-expert.md`)
+  - Detects: `.Result` blocking, missing `ConfigureAwait`, deadlocks
+
+2. **MemoryExpert** (`dotnet-memory-expert.md`)
+  - Detects: Undisposed resources, memory leaks, event handler leaks
+
+3. **ParallelExpert** (`dotnet-parallel-expert.md`)
+  - Detects: Race conditions, thread-unsafe collections, improper locking
+
+4. **DDDExpert** (`dotnet-ddd-expert.md`)
+  - Detects: Aggregate boundary issues, anemic domain models, invariant leaks
+
+5. **DIExpert** (`dotnet-di-expert.md`)
+  - Detects: Lifetime mismatches, captive dependencies, service locator anti-patterns
+
+6. **LayeringExpert** (`dotnet-layering-expert.md`)
+  - Detects: Layer boundary violations, dependency direction drift
 
 ## Future Phases
 
@@ -327,20 +342,21 @@ Large files (10k+ LOC) are automatically truncated to 15000 characters to avoid 
 - ✅ Phase 1: Repository ingestion and file collection
 - ✅ Phase 1: Multi-file batch analysis orchestration
 - ✅ Phase 1: Results aggregation and JSON reporting
-- ✅ Phase 1: CLI argument parsing and flexibility
-- ⚠️ Phase 1: Main orchestrator (`scatter_gather_poc.py`) — missing, must be restored
-- ⏳ Phase 2: Metadata extraction and type awareness
-- ⏳ Phase 3: DDD and DI expert specialists
-- ⏳ Phase 4: Large-scale optimization and caching
+- ✅ Phase 1: Orchestrator restored (`scatter_gather_poc.py`)
+- ✅ Phase 2: Metadata extraction (Roslyn + heuristic fallback)
+- ✅ Phase 3: DDD/DI/Layering expert specialists
+- ✅ Phase 4: Token-aware batching and concurrency controls
+- ✅ Phase 4: Incremental caching, resume checkpoints, deduplication
+- ✅ Tests: Parsing, metadata fallback, state persistence, resume, dedup
 
 ---
 ## Plan: Phase 2-4 End-to-End Delivery (v2)
 
 Deliver Phases 2, 3, and 4 by first restoring the missing orchestration baseline, then adding Roslyn-backed metadata extraction (with heuristic fallback), expanding expert coverage (DDD/DI/layering), and implementing scalability controls (token-aware batching, incremental git+hash analysis, deduplication, and checkpoint resume).
 
-> **Known gap**: Phase 1 is marked COMPLETE in this guide, but the main orchestrator
-> (`scatter_gather_poc.py`) is missing from the repository. Step 1 below restores it.
-> Until that file exists, none of the Phase 1 deliverables are runnable.
+> **Status update**: The orchestrator gap has been resolved. `scatter_gather_poc.py`
+> is restored and currently wires metadata enrichment, incremental caching, resume,
+> deduplication, and dry-run controls.
 
 ### Expert Output Schema (target)
 
