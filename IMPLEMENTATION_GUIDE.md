@@ -1,6 +1,6 @@
 # Scatter-Gather POC: Multi-Expert Repository Analysis
 
-**Phase 1: Repository Foundation** - ✅ COMPLETE
+**Phase 1: Repository Foundation** - ⚠️ PARTIAL (modules complete, orchestrator missing)
 
 ## Overview
 
@@ -328,10 +328,155 @@ Large files (10k+ LOC) are automatically truncated to 15000 characters to avoid 
 - ✅ Phase 1: Multi-file batch analysis orchestration
 - ✅ Phase 1: Results aggregation and JSON reporting
 - ✅ Phase 1: CLI argument parsing and flexibility
+- ⚠️ Phase 1: Main orchestrator (`scatter_gather_poc.py`) — missing, must be restored
 - ⏳ Phase 2: Metadata extraction and type awareness
 - ⏳ Phase 3: DDD and DI expert specialists
 - ⏳ Phase 4: Large-scale optimization and caching
 
 ---
+## Plan: Phase 2-4 End-to-End Delivery (v2)
 
-**Status**: Production-ready for Phase 1. Ready for Phase 2 metadata extraction.
+Deliver Phases 2, 3, and 4 by first restoring the missing orchestration baseline, then adding Roslyn-backed metadata extraction (with heuristic fallback), expanding expert coverage (DDD/DI/layering), and implementing scalability controls (token-aware batching, incremental git+hash analysis, deduplication, and checkpoint resume).
+
+> **Known gap**: Phase 1 is marked COMPLETE in this guide, but the main orchestrator
+> (`scatter_gather_poc.py`) is missing from the repository. Step 1 below restores it.
+> Until that file exists, none of the Phase 1 deliverables are runnable.
+
+### Expert Output Schema (target)
+
+All experts MUST return a JSON array. The parser accepts this schema and falls back to
+plain-text extraction for backward compatibility.
+
+```json
+[
+  {
+    "issue": "string — one-sentence description of the problem",
+    "severity": "critical | high | medium | low",
+    "category": "async | memory | parallel | ddd | di | layering",
+    "recommendation": "string — fix instruction for the Refactor Agent",
+    "line_range": [10, 15]
+  }
+]
+```
+
+### New File Manifest
+
+| Artifact | Path | Purpose |
+|----------|------|---------|
+| Main orchestrator | `scatter_gather_poc.py` | Restored Phase 1 entry point |
+| Roslyn helper project | `RoslynMetadataExtractor/` | .NET project emitting metadata JSON |
+| Python metadata consumer | `metadata_enricher.py` | Ingests Roslyn JSON, enriches prompts |
+| State & checkpoint manager | `analysis_state.py` | Incremental state, fingerprints, resume |
+| DDD expert skill | `Skills/dotnet-ddd-expert.md` | Domain-driven design analysis |
+| DI expert skill | `Skills/dotnet-di-expert.md` | Dependency injection analysis |
+| Layering expert skill | `Skills/dotnet-layering-expert.md` | Architectural layer boundary analysis |
+| Integration tests | `tests/` | Pytest suite for parsing, state, dedup |
+
+### Steps
+
+1. **Baseline Recovery** — Recreate `scatter_gather_poc.py` with the documented Phase 1 flow: CLI parsing, repo/local/default input, file collection via `CSFileCollector`, batching via `batch_files()`, async expert scatter-gather, `ResultsAggregator` report save and summary print. Fix the `analyzed_at` bug in `results_aggregator.py` (use `datetime.now().isoformat()` instead of file mtime). This is the mandatory foundation for all later steps.
+
+2. **Structured Finding Parsing** — Upgrade `ResultsAggregator.create_file_feedback()` to prefer the JSON schema above, with plain-text fallback for backward compatibility. Normalize severity to lowercase enum, category to stable mapping (`async`, `memory`, `parallel`, `ddd`, `di`, `layering`). Add pytest coverage for both JSON and plain-text parsing paths. **Depends on step 1.**
+
+3. **Expert Expansion** — Add `Skills/dotnet-ddd-expert.md`, `Skills/dotnet-di-expert.md`, `Skills/dotnet-layering-expert.md` using current frontmatter conventions. Each skill MUST emit the JSON schema above (with plain-text "CATEGORY: Clean." when no findings). Register all six experts in `scatter_gather_poc.py`. **Depends on step 2** (parser must handle JSON before new experts start emitting it).
+
+4. **Roslyn Pipeline Bootstrap** — Add `RoslynMetadataExtractor/` .NET project using MSBuildWorkspace + Compilation + SemanticModel to emit repository metadata JSON (symbols, type hierarchy, inheritance, constructor dependencies, call references, project graph). Ship as a self-contained local project invoked via `dotnet run` subprocess from Python. **Depends on step 1. High-risk item — see risk mitigation below.**
+
+5. **Heuristic Metadata Fallback** — Implement regex/pattern-based metadata extraction in `metadata_enricher.py` that runs when Roslyn extraction is unavailable (missing SDK, private NuGet feeds, multi-TFM build failures). Extracts: class name, base types, interface implementations, constructor parameters, namespace, `[ApiController]`/`[HttpGet]` attributes. This is a **first-class deliverable**, not optional. **Parallel with step 4.**
+
+6. **Python Metadata Integration** — Extend `metadata_enricher.py` to consume Roslyn JSON (preferred) or heuristic output (fallback) and enrich per-file expert prompts with structured context (type kind, namespace, base types, constructor injections, related symbols/files, inferred architectural layer). **Depends on steps 4 and 5.**
+
+7. **Token-Aware Batching and Concurrency Controls** — Extend the existing `batch_files(max_tokens_per_batch=)` in `repo_ingestion.py` (already supports chars/4 heuristic). Surface CLI flags: `--max-tokens-per-batch`, `--max-concurrency`. Add `asyncio.Semaphore`-based request throttling during expert fan-out. Add `--dry-run` mode that reports projected file count, batch count, and estimated API calls without invoking any model. **Depends on step 1.**
+
+8. **Incremental Analysis (Git + Hash)** — Add `analysis_state.py` with persisted state: repository key, config signature, last analyzed commit SHA, per-file SHA-256 fingerprints, cached per-file `FileFeedback`. Use `git diff` when available to compute changed candidates; fall back to fingerprint-based invalidation when git context is unavailable. Scope: direct file-change detection only — defer transitive dependency invalidation to a future phase. **Depends on step 1.**
+
+9. **Progress Persistence and Resume** — Checkpoint completed files and partial feedback to `analysis_state.py` after each batch. Support `--resume` flag that restores checkpoint state, skips completed work, and clears checkpoint only after successful completion. **Depends on steps 8 and 2.**
+
+10. **Finding Deduplication** — Deduplicate findings by normalized signature (expert, category, severity, canonicalized issue text), both within a single file and across resumed/cached merges. Add pytest coverage for dedup edge cases. **Depends on step 2.**
+
+11. **Integration Tests** — Add `tests/` directory with pytest suite covering: structured JSON parsing, plain-text fallback parsing, severity/category normalization, incremental state persistence and invalidation, checkpoint resume with partial state, finding deduplication. Use a small fixture `.cs` file set. **Parallel with steps 8-10.**
+
+12. **Reporting and Docs Update** — Extend report JSON scope with: `metadata_extraction_status` (roslyn/heuristic/none), `cache_hits`, `resumed_count`, `files_analyzed_fresh` vs `files_reused`, category metrics for `ddd`/`di`/`layering`. Update this guide and `README.md` for new CLI flags, Roslyn prerequisites, expert list, resume workflow, and `--dry-run` usage. **Depends on steps 2-10.**
+
+13. **Validation** — Run `pytest tests/`. Execute representative dry-runs: default snippet, local repo with `--max-files 10`, incremental rerun (expect cache hits), interrupted-and-resume run, `--dry-run` mode. Verify expected report fields and behavior. **Depends on all prior steps.**
+
+### Dependency Graph
+
+```
+Step 1 (Baseline)
+  ├── Step 2 (Parsing) ──┬── Step 3 (New Experts)
+  │                      ├── Step 9 (Resume)
+  │                      ├── Step 10 (Dedup)
+  │                      └── Step 12 (Docs)
+  ├── Step 4 (Roslyn) ───┤
+  ├── Step 5 (Heuristic) ─┤
+  │                       └── Step 6 (Metadata Integration)
+  ├── Step 7 (Batching/Concurrency)
+  ├── Step 8 (Incremental) ── Step 9 (Resume)
+  └── Step 11 (Tests, parallel with 8-10)
+
+Step 13 (Validation) depends on all.
+```
+
+### Risk Mitigation: Roslyn Integration
+
+MSBuildWorkspace requires the target repo's full dependency graph to be restorable (`dotnet restore` must succeed). This will fail for repos with:
+- Private NuGet feeds without configured credentials
+- Conditional or multi-TFM build targets
+- Missing SDKs or workloads
+
+**Mitigation**: Step 5 (heuristic fallback) is a first-class deliverable that ships alongside Roslyn. The orchestrator transparently degrades: Roslyn JSON → heuristic extraction → no metadata (experts still run, just without enrichment). `metadata_extraction_status` in the report indicates which path was used.
+
+### Cost and Rate-Limit Controls
+
+With 6 experts × N files, API call volume scales quickly. Controls:
+- `--max-concurrency` (default: 5) limits parallel expert requests via `asyncio.Semaphore`
+- `--max-tokens-per-batch` caps total source tokens per batch
+- `--max-files` caps total analysis scope
+- `--dry-run` reports projected call count and batch layout without invoking any model
+- Incremental mode (step 8) skips unchanged files entirely
+
+### Relevant Files
+
+| File | Role |
+|------|------|
+| `scatter_gather_poc.py` (new) | Main orchestrator — restored in step 1 |
+| `repo_ingestion.py` | Reuse/extend batching and project graph utilities |
+| `results_aggregator.py` | Structured parser, normalization, dedup, report enhancements |
+| `metadata_enricher.py` (new) | Roslyn JSON + heuristic metadata consumer |
+| `analysis_state.py` (new) | Incremental state, fingerprints, checkpoint/resume |
+| `RoslynMetadataExtractor/` (new) | .NET Roslyn helper project |
+| `Skills/dotnet-async-expert.md` | Existing — add JSON output schema guidance |
+| `Skills/dotnet-memory-expert.md` | Existing — add JSON output schema guidance |
+| `Skills/dotnet-parallel-expert.md` | Existing — add JSON output schema guidance |
+| `Skills/dotnet-ddd-expert.md` (new) | DDD expert skill |
+| `Skills/dotnet-di-expert.md` (new) | DI expert skill |
+| `Skills/dotnet-layering-expert.md` (new) | Layering expert skill |
+| `tests/` (new) | Pytest integration tests |
+| `requirements.txt` | Add test dependencies if needed |
+| `README.md` | User-facing docs update |
+| `IMPLEMENTATION_GUIDE.md` | Architecture/status update |
+
+### Verification
+
+1. **Startup**: `python scatter_gather_poc.py --help` lists all Phase 4 flags (`--max-tokens-per-batch`, `--max-concurrency`, `--resume`, `--dry-run`, `--cache-dir`).
+2. **Roslyn extraction**: `dotnet run --project RoslynMetadataExtractor` produces metadata JSON for a small test repo with symbols/types/inheritance/project references.
+3. **Heuristic fallback**: Running without .NET SDK installed still produces metadata via regex extraction; report shows `metadata_extraction_status: "heuristic"`.
+4. **Expert registration**: Console scope lists six experts; each contributes activations in report metrics.
+5. **Structured parsing**: Experts returning JSON findings are parsed into multiple findings per expert per file; plain-text responses produce stable findings via fallback.
+6. **Incremental**: Second run with no code changes reuses cache and skips analysis; modifying one .cs file triggers only that file.
+7. **Resume**: Interrupt run mid-way, relaunch with `--resume`, verify completed files are skipped and final report is complete without duplication.
+8. **Dedup**: Repeated equivalent findings across retries/resume are collapsed to single canonical entries.
+9. **Dry-run**: `--dry-run` outputs batch layout and projected API call count, makes zero model requests.
+10. **Reporting**: Output JSON includes `metadata_extraction_status`, `cache_hits`, `resumed_count`, `files_analyzed_fresh`, and category metrics for `ddd`/`di`/`layering`.
+11. **Tests**: `pytest tests/` passes with coverage for parsing, state, and dedup modules.
+12. **Documentation**: README and this guide match actual CLI behavior and new prerequisites.
+
+### Decisions
+
+- Roslyn fallback is a first-class deliverable (step 5), not optional.
+- Structured JSON parsing (step 2) must precede expert expansion (step 3) to avoid format mismatch.
+- Transitive dependency invalidation is deferred — incremental mode detects direct file changes only.
+- Output schema is versioned via a `"schema_version": 2` field in report JSON for safe consumer migration.
+- Automated pytest suite is required — manual-only verification does not scale for incremental/resume/dedup.
+- Existing `batch_files(max_tokens_per_batch=)` in `repo_ingestion.py` is reused, not reimplemented.

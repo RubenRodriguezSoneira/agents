@@ -7,6 +7,7 @@ Consolidates findings from multiple files and experts into structured reports.
 import json
 import logging
 from dataclasses import dataclass, asdict
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -142,7 +143,7 @@ class ResultsAggregator:
 
         return RepositoryReport(
             repository_name="<repository>",
-            analyzed_at=Path(__file__).stat().st_mtime,
+            analyzed_at=datetime.now().isoformat(),
             scope={},
             file_feedbacks=file_feedbacks,
             summary_metrics=summary_metrics,
