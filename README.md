@@ -70,12 +70,30 @@ python scatter_gather_poc.py --local C:\path\to\repo --resume
 --max-files MAX_FILES                Limit files analyzed
 --no-hot-path-only                   Analyze all files (disable hot-path prioritization)
 --max-tokens-per-batch N             Token-cap batching (chars/4 estimate)
---max-concurrency N                  Max concurrent model requests (default: 5)
+--max-concurrency N                  Max concurrent model requests (default: 2)
+--max-requests-per-minute N          Global pacing limit for model requests (default: 12)
+--max-retries N                      OpenAI client internal retry attempts (default: 5)
+--max-rate-limit-retries N           Additional retries after HTTP 429 (default: 3)
 --cache-dir PATH                     State/checkpoint directory (default: .sg_cache)
 --resume                             Resume from checkpoint
 --dry-run                            Show projected batches and calls only
 --roslyn-timeout SECONDS             Roslyn metadata timeout (default: 300)
 ```
+
+### Rate Limiting & Concurrency
+
+The system handles HTTP 429 (Too Many Requests) errors with automatic retry logic:
+
+- **Concurrency Control**: `--max-concurrency` controls simultaneous in-flight requests
+- **Global Pacing**: `--max-requests-per-minute` enforces a global request interval across all experts/files
+- **Built-in Retries**: `--max-retries` controls SDK-level retries for transient API failures
+- **Extra 429 Retries**: `--max-rate-limit-retries` adds outer retries after SDK retries are exhausted
+
+If you're still hitting rate limits after retries:
+1. Reduce `--max-requests-per-minute` first (for example, 6-10)
+2. Reduce `--max-concurrency` to 1-2
+3. Increase `--max-rate-limit-retries` if you can tolerate longer runs
+4. Use `--batch-size 1` for the most conservative request pattern
 
 ### Metadata Extraction
 

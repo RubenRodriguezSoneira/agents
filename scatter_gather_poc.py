@@ -5,13 +5,14 @@ import asyncio
 import logging
 import os
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
-from openai import AsyncOpenAI, OpenAIError
+from openai import AsyncOpenAI, OpenAIError, RateLimitError
 
 from analysis_state import AnalysisStateManager, make_config_signature
 from metadata_enricher import build_metadata_context, extract_repository_metadata
@@ -22,8 +23,13 @@ from results_aggregator import FileFeedback, ResultsAggregator
 GITHUB_MODELS_ENDPOINT = "https://models.github.ai/inference"
 DEFAULT_MODEL = "gpt-4.1"
 MAX_SOURCE_CHARS = 15000
-DEFAULT_MAX_CONCURRENCY = 5
+DEFAULT_MAX_CONCURRENCY = 2
+DEFAULT_MAX_REQUESTS_PER_MINUTE = 12
 DEFAULT_ROSLYN_TIMEOUT = 300
+MAX_RETRIES = 5
+DEFAULT_MAX_RATE_LIMIT_RETRIES = 3
+INITIAL_RETRY_BACKOFF_SECS = 2
+MAX_RETRY_BACKOFF_SECS = 60
 
 logger = logging.getLogger(__name__)
 FAILED_FEEDBACK_PREFIX = "No findings returned because this expert failed"
@@ -89,6 +95,54 @@ class AnalysisPlan:
     resumed_count: int
 
 
+class RequestRateLimiter:
+    """Simple global request pacer using a fixed minimum interval."""
+
+    def __init__(self, requests_per_minute: int) -> None:
+        if requests_per_minute <= 0:
+            raise ValueError("requests_per_minute must be greater than 0")
+
+        self._interval_seconds = 60.0 / float(requests_per_minute)
+        self._next_available_at = 0.0
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        async with self._lock:
+            now = time.monotonic()
+            wait_for = self._next_available_at - now
+            if wait_for > 0:
+                await asyncio.sleep(wait_for)
+                now = time.monotonic()
+
+            self._next_available_at = max(self._next_available_at, now) + self._interval_seconds
+
+    async def penalize(self, seconds: float) -> None:
+        if seconds <= 0:
+            return
+
+        async with self._lock:
+            self._next_available_at = max(
+                self._next_available_at,
+                time.monotonic() + seconds,
+            )
+
+
+def _retry_after_seconds(exc: RateLimitError) -> Optional[float]:
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+
+    retry_after = headers.get("retry-after")
+    if retry_after is None:
+        return None
+
+    try:
+        return max(0.0, float(retry_after))
+    except (TypeError, ValueError):
+        return None
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Scatter-Gather POC: Multi-expert code analysis for .NET projects"
@@ -150,7 +204,25 @@ def parse_args() -> argparse.Namespace:
         "--max-concurrency",
         type=int,
         default=DEFAULT_MAX_CONCURRENCY,
-        help="Max concurrent model requests across all experts (default: 5)",
+        help="Max concurrent model requests across all experts (default: 2)",
+    )
+    parser.add_argument(
+        "--max-requests-per-minute",
+        type=int,
+        default=DEFAULT_MAX_REQUESTS_PER_MINUTE,
+        help="Global pacing limit for outbound model requests (default: 12)",
+    )
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=MAX_RETRIES,
+        help="OpenAI client internal retry attempts for transient failures (default: 5)",
+    )
+    parser.add_argument(
+        "--max-rate-limit-retries",
+        type=int,
+        default=DEFAULT_MAX_RATE_LIMIT_RETRIES,
+        help="Additional retries after 429 responses with exponential backoff (default: 3)",
     )
     parser.add_argument(
         "--cache-dir",
@@ -202,6 +274,9 @@ def _build_config_signature(args: argparse.Namespace, model: str, experts: tuple
         "experts": [expert.name for expert in experts],
         "batch_size": args.batch_size,
         "max_tokens_per_batch": args.max_tokens_per_batch,
+        "max_concurrency": args.max_concurrency,
+        "max_requests_per_minute": args.max_requests_per_minute,
+        "max_rate_limit_retries": args.max_rate_limit_retries,
         "hot_path_only": not args.no_hot_path_only,
         "max_files": args.max_files,
         "max_source_chars": MAX_SOURCE_CHARS,
@@ -261,21 +336,52 @@ async def run_agent(
     name: str,
     instructions: str,
     user_prompt: str,
+    rate_limiter: RequestRateLimiter,
+    max_rate_limit_retries: int,
 ) -> str:
-    try:
-        response = await client.chat.completions.create(
-            model=model,
-            temperature=0,
-            messages=[
-                {"role": "system", "content": instructions},
-                {"role": "user", "content": user_prompt},
-            ],
-        )
-    except OpenAIError as exc:
-        raise RuntimeError(f"{name} failed to generate a response.") from exc
+    """Run an agent with request pacing and robust 429 retry handling."""
+    for attempt in range(max_rate_limit_retries + 1):
+        await rate_limiter.acquire()
+        try:
+            response = await client.chat.completions.create(
+                model=model,
+                temperature=0,
+                messages=[
+                    {"role": "system", "content": instructions},
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+            content = response.choices[0].message.content
+            return content.strip() if content else ""
+        except RateLimitError as exc:
+            if attempt >= max_rate_limit_retries:
+                raise RuntimeError(
+                    f"{name} failed due to repeated rate limiting after "
+                    f"{max_rate_limit_retries + 1} attempts."
+                ) from exc
 
-    content = response.choices[0].message.content
-    return content.strip() if content else ""
+            retry_after = _retry_after_seconds(exc)
+            computed_backoff = min(
+                MAX_RETRY_BACKOFF_SECS,
+                float(INITIAL_RETRY_BACKOFF_SECS * (2 ** attempt)),
+            )
+            wait_seconds = retry_after if retry_after is not None else computed_backoff
+
+            # Add small deterministic jitter to reduce synchronized retries.
+            wait_seconds += min(1.0, 0.2 * (attempt + 1))
+
+            logger.warning(
+                "%s hit HTTP 429. Waiting %.1fs before retry %d/%d.",
+                name,
+                wait_seconds,
+                attempt + 1,
+                max_rate_limit_retries,
+            )
+            await rate_limiter.penalize(wait_seconds)
+            await asyncio.sleep(wait_seconds)
+        except OpenAIError as exc:
+            logger.exception("%s OpenAI error: %s", name, exc)
+            raise RuntimeError(f"{name} failed to generate a response: {exc}") from exc
 
 
 async def run_agent_throttled(
@@ -286,6 +392,8 @@ async def run_agent_throttled(
     name: str,
     instructions: str,
     user_prompt: str,
+    rate_limiter: RequestRateLimiter,
+    max_rate_limit_retries: int,
 ) -> str:
     async with semaphore:
         return await run_agent(
@@ -294,6 +402,8 @@ async def run_agent_throttled(
             name=name,
             instructions=instructions,
             user_prompt=user_prompt,
+            rate_limiter=rate_limiter,
+            max_rate_limit_retries=max_rate_limit_retries,
         )
 
 
@@ -306,6 +416,8 @@ async def gather_feedback(
     relative_path: Path,
     metadata_context: str,
     experts: tuple[ExpertAgent, ...],
+    rate_limiter: RequestRateLimiter,
+    max_rate_limit_retries: int,
 ) -> dict[str, str]:
     review_prompt = (
         f"File: {relative_path}\n\n"
@@ -323,6 +435,8 @@ async def gather_feedback(
             name=expert.name,
             instructions=expert.instructions,
             user_prompt=review_prompt,
+            rate_limiter=rate_limiter,
+            max_rate_limit_retries=max_rate_limit_retries,
         )
         for expert in experts
     ]
@@ -356,6 +470,8 @@ async def analyze_file(
     repo_root: Path,
     metadata_bundle: dict,
     experts: tuple[ExpertAgent, ...],
+    rate_limiter: RequestRateLimiter,
+    max_rate_limit_retries: int,
 ) -> FileFeedback:
     try:
         source_code = file_path.read_text(encoding="utf-8", errors="replace")
@@ -384,6 +500,8 @@ async def analyze_file(
         relative_path=relative_path,
         metadata_context=metadata_context,
         experts=experts,
+        rate_limiter=rate_limiter,
+        max_rate_limit_retries=max_rate_limit_retries,
     )
 
     return ResultsAggregator.create_file_feedback(file_path, repo_root, feedback_by_agent)
@@ -398,6 +516,8 @@ async def analyze_batch(
     repo_root: Path,
     metadata_bundle: dict,
     experts: tuple[ExpertAgent, ...],
+    rate_limiter: RequestRateLimiter,
+    max_rate_limit_retries: int,
 ) -> list[FileFeedback]:
     tasks = [
         analyze_file(
@@ -408,6 +528,8 @@ async def analyze_batch(
             repo_root=repo_root,
             metadata_bundle=metadata_bundle,
             experts=experts,
+            rate_limiter=rate_limiter,
+            max_rate_limit_retries=max_rate_limit_retries,
         )
         for file_path in batch_files_list
     ]
@@ -434,6 +556,8 @@ def _print_scope(
     metadata_status: str,
     experts: tuple[ExpertAgent, ...],
     max_concurrency: int,
+    max_requests_per_minute: int,
+    max_rate_limit_retries: int,
     output: Path,
 ) -> None:
     print(f"\n{'=' * 70}")
@@ -449,6 +573,8 @@ def _print_scope(
     print(f"Metadata extraction status: {metadata_status}")
     print(f"Experts: {len(experts)} ({', '.join(e.name for e in experts)})")
     print(f"Max concurrency: {max_concurrency}")
+    print(f"Max requests per minute: {max_requests_per_minute}")
+    print(f"Extra 429 retries: {max_rate_limit_retries}")
     print(f"Output: {output}")
     print(f"{'=' * 70}\n")
 
@@ -608,6 +734,10 @@ async def main() -> None:
         raise ValueError("--batch-size must be greater than 0.")
     if args.max_concurrency <= 0:
         raise ValueError("--max-concurrency must be greater than 0.")
+    if args.max_requests_per_minute <= 0:
+        raise ValueError("--max-requests-per-minute must be greater than 0.")
+    if args.max_rate_limit_retries < 0:
+        raise ValueError("--max-rate-limit-retries cannot be negative.")
     if args.max_tokens_per_batch is not None and args.max_tokens_per_batch <= 0:
         raise ValueError("--max-tokens-per-batch must be greater than 0 when provided.")
     if args.roslyn_timeout <= 0:
@@ -620,6 +750,7 @@ async def main() -> None:
     config_signature = _build_config_signature(args, model=model, experts=experts)
 
     temp_context: Optional[tempfile.TemporaryDirectory] = None
+    client: Optional[AsyncOpenAI] = None
 
     try:
         source_mode = "default"
@@ -689,7 +820,11 @@ async def main() -> None:
             return
 
         github_token = _require_token(args.token)
-        client = AsyncOpenAI(api_key=github_token, base_url=GITHUB_MODELS_ENDPOINT)
+        client = AsyncOpenAI(
+            api_key=github_token,
+            base_url=GITHUB_MODELS_ENDPOINT,
+            max_retries=args.max_retries,
+        )
 
         metadata_bundle = extract_repository_metadata(
             repo_root=repo_root,
@@ -710,10 +845,13 @@ async def main() -> None:
             metadata_status=metadata_status,
             experts=experts,
             max_concurrency=args.max_concurrency,
+            max_requests_per_minute=args.max_requests_per_minute,
+            max_rate_limit_retries=args.max_rate_limit_retries,
             output=args.output,
         )
 
         semaphore = asyncio.Semaphore(args.max_concurrency)
+        rate_limiter = RequestRateLimiter(args.max_requests_per_minute)
 
         all_file_feedbacks: list[FileFeedback] = []
         all_file_feedbacks.extend(plan.reused_feedbacks)
@@ -740,6 +878,8 @@ async def main() -> None:
                 repo_root=repo_root,
                 metadata_bundle=metadata_bundle,
                 experts=experts,
+                rate_limiter=rate_limiter,
+                max_rate_limit_retries=args.max_rate_limit_retries,
             )
 
             fresh_feedbacks.extend(batch_feedbacks)
@@ -772,6 +912,8 @@ async def main() -> None:
             "batch_size": args.batch_size,
             "max_tokens_per_batch": args.max_tokens_per_batch,
             "max_concurrency": args.max_concurrency,
+            "max_requests_per_minute": args.max_requests_per_minute,
+            "max_rate_limit_retries": args.max_rate_limit_retries,
             "hot_path_only": not args.no_hot_path_only,
             "branch": args.branch,
             "cache_dir": str(state_manager.cache_dir) if state_manager is not None else None,
@@ -809,6 +951,12 @@ async def main() -> None:
             if args.resume:
                 state_manager.clear_checkpoint()
     finally:
+        if client is not None:
+            try:
+                await client.close()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to close AsyncOpenAI client cleanly: %s", exc)
+
         if temp_context is not None:
             temp_context.cleanup()
 
