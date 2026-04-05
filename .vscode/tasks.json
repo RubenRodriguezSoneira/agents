@@ -1,0 +1,29 @@
+{
+  // This file defines VS Code tasks for .NET projects.
+  "version": "2.0.0",
+  "tasks": [
+    {
+      // Task to build the entire solution using dotnet build.
+      "label": "build",
+      "command": "dotnet",
+      "type": "process",
+      "args": [
+        "build",
+        "${workspaceFolder}"
+      ]
+    },
+    {
+      // Task to restore NuGet packages for the solution.
+      "label": "dotnet restore",
+      "type": "shell",
+      "command": "dotnet",
+      "args": [
+        "restore"
+      ],
+      "group": {
+        "kind": "build",
+        "isDefault": false
+      }
+    }
+  ]
+}
