@@ -21,7 +21,11 @@ from results_aggregator import FileFeedback, ResultsAggregator
 
 
 GITHUB_MODELS_ENDPOINT = "https://models.github.ai/inference"
+OLLAMA_DEFAULT_ENDPOINT = "http://localhost:11434/v1"
+PROVIDER_GITHUB = "github"
+PROVIDER_OLLAMA = "ollama"
 DEFAULT_MODEL = "gpt-4.1"
+DEFAULT_OLLAMA_MODEL = "qwen3-coder-next"
 MAX_SOURCE_CHARS = 15000
 DEFAULT_MAX_CONCURRENCY = 2
 DEFAULT_MAX_REQUESTS_PER_MINUTE = 12
@@ -34,7 +38,8 @@ MAX_RETRY_BACKOFF_SECS = 60
 logger = logging.getLogger(__name__)
 FAILED_FEEDBACK_PREFIX = "No findings returned because this expert failed"
 SKILLS_DIR = Path(__file__).resolve().parent / "Skills"
-ROSLYN_EXTRACTOR_DIR = Path(__file__).resolve().parent / "RoslynMetadataExtractor"
+ROSLYN_EXTRACTOR_DIR = Path(
+    __file__).resolve().parent / "RoslynMetadataExtractor"
 
 
 @dataclass(frozen=True)
@@ -47,6 +52,13 @@ class ExpertAgent:
 class ExpertSkill:
     name: str
     skill_file: str
+
+
+@dataclass(frozen=True)
+class ModelConfig:
+    provider: str
+    model: str
+    base_url: str
 
 
 EXPERT_SKILLS: tuple[ExpertSkill, ...] = (
@@ -114,7 +126,8 @@ class RequestRateLimiter:
                 await asyncio.sleep(wait_for)
                 now = time.monotonic()
 
-            self._next_available_at = max(self._next_available_at, now) + self._interval_seconds
+            self._next_available_at = max(
+                self._next_available_at, now) + self._interval_seconds
 
     async def penalize(self, seconds: float) -> None:
         if seconds <= 0:
@@ -216,7 +229,31 @@ def parse_args() -> argparse.Namespace:
         "--max-retries",
         type=int,
         default=MAX_RETRIES,
-        help="OpenAI client internal retry attempts for transient failures (default: 5)",
+        help="Model client internal retry attempts for transient failures (default: 5)",
+    )
+    parser.add_argument(
+        "--provider",
+        choices=[PROVIDER_OLLAMA, PROVIDER_GITHUB],
+        default=None,
+        help="Model provider (github or ollama). Defaults to MODEL_PROVIDER env or github.",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help=(
+            "Model name override. Defaults to GITHUB_MODEL (provider=github) "
+            "or OLLAMA_MODEL (provider=ollama)."
+        ),
+    )
+    parser.add_argument(
+        "--ollama-base-url",
+        type=str,
+        default=None,
+        help=(
+            "Ollama OpenAI-compatible endpoint (default: OLLAMA_BASE_URL env "
+            "or http://localhost:11434/v1). If /v1 is missing, it is added automatically."
+        ),
     )
     parser.add_argument(
         "--max-rate-limit-retries",
@@ -258,6 +295,92 @@ def _require_token(cli_token: str | None) -> str:
     return token
 
 
+def _build_model_config(args: argparse.Namespace) -> ModelConfig:
+    provider = (args.provider or os.getenv("MODEL_PROVIDER")
+                or PROVIDER_GITHUB).strip().lower()
+    if provider not in {PROVIDER_GITHUB, PROVIDER_OLLAMA}:
+        raise ValueError(
+            f"Unsupported provider: {provider!r}. Choose '{PROVIDER_GITHUB}' or '{PROVIDER_OLLAMA}'."
+        )
+
+    if provider == PROVIDER_OLLAMA:
+        model = (args.model or os.getenv("OLLAMA_MODEL")
+                 or DEFAULT_OLLAMA_MODEL).strip()
+        raw_base_url = (
+            args.ollama_base_url
+            or os.getenv("OLLAMA_BASE_URL")
+            or OLLAMA_DEFAULT_ENDPOINT
+        )
+        base_url = raw_base_url.rstrip("/")
+        if not base_url.endswith("/v1"):
+            base_url = f"{base_url}/v1"
+            logger.info(
+                "Normalized Ollama base URL from '%s' to '%s' for OpenAI-compatible API.",
+                raw_base_url,
+                base_url,
+            )
+    else:
+        model = (args.model or os.getenv(
+            "GITHUB_MODEL") or DEFAULT_MODEL).strip()
+        base_url = GITHUB_MODELS_ENDPOINT
+
+    if not model:
+        raise ValueError("Model name cannot be empty.")
+
+    return ModelConfig(provider=provider, model=model, base_url=base_url)
+
+
+def _normalize_model_name(name: str) -> str:
+    return name.strip().lower()
+
+
+def _model_name_matches(requested: str, available: str) -> bool:
+    req = _normalize_model_name(requested)
+    avail = _normalize_model_name(available)
+    if req == avail:
+        return True
+
+    # Treat explicit and implicit latest tags as equivalent.
+    if req.endswith(":latest"):
+        return req[:-7] == avail
+    if avail.endswith(":latest"):
+        return req == avail[:-7]
+
+    return False
+
+
+async def _validate_ollama_model(client: AsyncOpenAI, model: str) -> None:
+    """Fail fast when selected Ollama model is not available locally."""
+    try:
+        models_response = await client.models.list()
+    except OpenAIError as exc:
+        raise RuntimeError(
+            "Failed to query Ollama models from the OpenAI-compatible API. "
+            "Confirm Ollama is running and reachable at the configured endpoint."
+        ) from exc
+
+    available_models = [
+        item.id
+        for item in models_response.data
+        if getattr(item, "id", None)
+    ]
+
+    if not available_models:
+        raise RuntimeError(
+            "No Ollama models were reported by /v1/models. "
+            "Pull a model first and rerun."
+        )
+
+    if any(_model_name_matches(model, available) for available in available_models):
+        return
+
+    preview = ", ".join(sorted(available_models)[:10])
+    raise RuntimeError(
+        f"Ollama model '{model}' was not found. Available models: {preview}. "
+        "Use --model with one of the available model IDs, or pull the requested model first."
+    )
+
+
 def _normalize_relative_path(path: str | Path) -> str:
     return Path(path).as_posix()
 
@@ -270,6 +393,7 @@ def _resolve_cache_dir(repo_root: Path, cache_dir: Path) -> Path:
 
 def _build_config_signature(args: argparse.Namespace, model: str, experts: tuple[ExpertAgent, ...]) -> str:
     config_payload = {
+        "provider": args.provider,
         "model": model,
         "experts": [expert.name for expert in experts],
         "batch_size": args.batch_size,
@@ -290,7 +414,7 @@ def _strip_frontmatter(markdown_text: str) -> str:
     if len(lines) >= 3 and lines[0].strip() == "---":
         for idx in range(1, len(lines)):
             if lines[idx].strip() == "---":
-                return "\n".join(lines[idx + 1 :]).strip()
+                return "\n".join(lines[idx + 1:]).strip()
     return markdown_text.strip()
 
 
@@ -381,7 +505,8 @@ async def run_agent(
             await asyncio.sleep(wait_seconds)
         except OpenAIError as exc:
             logger.exception("%s OpenAI error: %s", name, exc)
-            raise RuntimeError(f"{name} failed to generate a response: {exc}") from exc
+            raise RuntimeError(
+                f"{name} failed to generate a response: {exc}") from exc
 
 
 async def run_agent_throttled(
@@ -445,7 +570,8 @@ async def gather_feedback(
     feedback_by_agent: dict[str, str] = {}
     for expert, result in zip(experts, results):
         if isinstance(result, Exception):
-            logger.error("%s failed during feedback gathering: %s", expert.name, result)
+            logger.error("%s failed during feedback gathering: %s",
+                         expert.name, result)
             feedback_by_agent[expert.name] = (
                 "No findings returned because this expert failed to respond."
             )
@@ -456,7 +582,8 @@ async def gather_feedback(
         feedback.startswith(FAILED_FEEDBACK_PREFIX)
         for feedback in feedback_by_agent.values()
     ):
-        logger.warning("All experts failed to respond for file: %s", relative_path)
+        logger.warning(
+            "All experts failed to respond for file: %s", relative_path)
 
     return feedback_by_agent
 
@@ -476,7 +603,8 @@ async def analyze_file(
     try:
         source_code = file_path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
-        logger.warning("Could not read %s (%s); using placeholder", file_path, exc)
+        logger.warning(
+            "Could not read %s (%s); using placeholder", file_path, exc)
         source_code = f"[File unreadable: {file_path.name}]"
 
     source_code = _truncate_source(source_code, file_path)
@@ -558,6 +686,9 @@ def _print_scope(
     max_concurrency: int,
     max_requests_per_minute: int,
     max_rate_limit_retries: int,
+    provider: str,
+    model: str,
+    base_url: str,
     output: Path,
 ) -> None:
     print(f"\n{'=' * 70}")
@@ -572,6 +703,8 @@ def _print_scope(
     print(f"Files restored from checkpoint: {resumed_count}")
     print(f"Metadata extraction status: {metadata_status}")
     print(f"Experts: {len(experts)} ({', '.join(e.name for e in experts)})")
+    print(f"Provider/model: {provider}/{model}")
+    print(f"Endpoint: {base_url}")
     print(f"Max concurrency: {max_concurrency}")
     print(f"Max requests per minute: {max_requests_per_minute}")
     print(f"Extra 429 retries: {max_rate_limit_retries}")
@@ -586,6 +719,8 @@ def _print_dry_run(
     analysis_count: int,
     batch_count: int,
     experts: tuple[ExpertAgent, ...],
+    provider: str,
+    model: str,
 ) -> None:
     projected_calls = analysis_count * len(experts)
     print(f"\n{'=' * 70}")
@@ -595,6 +730,7 @@ def _print_dry_run(
     print(f"Total C# files found: {total_found}")
     print(f"Files selected for scope: {selected_count}")
     print(f"Files requiring fresh analysis: {analysis_count}")
+    print(f"Provider/model: {provider}/{model}")
     print(f"Batches: {batch_count}")
     print(f"Experts: {len(experts)} ({', '.join(e.name for e in experts)})")
     print(f"Projected model calls: {projected_calls}")
@@ -637,7 +773,8 @@ def _plan_analysis(
                 if isinstance(fp, str)
             }
 
-        cached_feedbacks = state_manager.deserialize_cached_feedbacks(state_payload)
+        cached_feedbacks = state_manager.deserialize_cached_feedbacks(
+            state_payload)
         changed_by_git = state_manager.changed_files_from_git(
             state_payload.get("last_analyzed_commit")
         )
@@ -672,7 +809,8 @@ def _plan_analysis(
     if resume_enabled:
         checkpoint_payload = state_manager.load_checkpoint()
         if checkpoint_payload and checkpoint_payload.get("config_signature") == config_signature:
-            checkpoint_completed = state_manager.deserialize_checkpoint_feedbacks(checkpoint_payload)
+            checkpoint_completed = state_manager.deserialize_checkpoint_feedbacks(
+                checkpoint_payload)
 
             remaining_files: list[Path] = []
             for file_path in files_requiring_analysis:
@@ -701,7 +839,8 @@ def _print_batch_summary(batch_feedbacks: list[FileFeedback]) -> None:
     critical_count = sum(
         1 for fb in batch_feedbacks for finding in fb.findings if finding.severity == "critical"
     )
-    print(f"  Batch complete: {total_findings} findings ({critical_count} critical)")
+    print(
+        f"  Batch complete: {total_findings} findings ({critical_count} critical)")
 
 
 def _print_top_critical_issues(file_feedbacks: list[FileFeedback], limit: int = 5) -> None:
@@ -739,15 +878,19 @@ async def main() -> None:
     if args.max_rate_limit_retries < 0:
         raise ValueError("--max-rate-limit-retries cannot be negative.")
     if args.max_tokens_per_batch is not None and args.max_tokens_per_batch <= 0:
-        raise ValueError("--max-tokens-per-batch must be greater than 0 when provided.")
+        raise ValueError(
+            "--max-tokens-per-batch must be greater than 0 when provided.")
     if args.roslyn_timeout <= 0:
         raise ValueError("--roslyn-timeout must be greater than 0.")
 
     load_dotenv()
     github_token = args.token or os.getenv("GITHUB_TOKEN")
-    model = os.getenv("GITHUB_MODEL", DEFAULT_MODEL)
+    model_config = _build_model_config(args)
+    args.provider = model_config.provider
+    model = model_config.model
     experts = load_expert_agents()
-    config_signature = _build_config_signature(args, model=model, experts=experts)
+    config_signature = _build_config_signature(
+        args, model=model, experts=experts)
 
     temp_context: Optional[tempfile.TemporaryDirectory] = None
     client: Optional[AsyncOpenAI] = None
@@ -771,7 +914,8 @@ async def main() -> None:
             all_cs_files = CSFileCollector.collect(repo_root)
             source_mode = "local"
         else:
-            temp_context = tempfile.TemporaryDirectory(prefix="scatter_gather_default_")
+            temp_context = tempfile.TemporaryDirectory(
+                prefix="scatter_gather_default_")
             repo_root = Path(temp_context.name)
             test_file = repo_root / "DefaultSnippet.cs"
             test_file.write_text(DEFAULT_MESSY_CODE, encoding="utf-8")
@@ -780,13 +924,15 @@ async def main() -> None:
 
         files_to_analyze = list(all_cs_files)
         if not args.no_hot_path_only and (args.repo or args.local):
-            files_to_analyze = CSFileCollector.prioritize_hot_paths(files_to_analyze)
+            files_to_analyze = CSFileCollector.prioritize_hot_paths(
+                files_to_analyze)
 
         if args.max_files is not None:
             files_to_analyze = files_to_analyze[: args.max_files]
 
         if not files_to_analyze:
-            raise RuntimeError("No C# files found to analyze with the selected options.")
+            raise RuntimeError(
+                "No C# files found to analyze with the selected options.")
 
         state_manager: Optional[AnalysisStateManager] = None
         if source_mode in {"repo", "local"}:
@@ -816,15 +962,24 @@ async def main() -> None:
                 analysis_count=len(plan.files_requiring_analysis),
                 batch_count=len(batches_to_run),
                 experts=experts,
+                provider=model_config.provider,
+                model=model,
             )
             return
 
-        github_token = _require_token(args.token)
+        if model_config.provider == PROVIDER_OLLAMA:
+            model_api_key = os.getenv("OLLAMA_API_KEY", "ollama")
+        else:
+            model_api_key = _require_token(args.token)
+
         client = AsyncOpenAI(
-            api_key=github_token,
-            base_url=GITHUB_MODELS_ENDPOINT,
+            api_key=model_api_key,
+            base_url=model_config.base_url,
             max_retries=args.max_retries,
         )
+
+        if model_config.provider == PROVIDER_OLLAMA:
+            await _validate_ollama_model(client, model)
 
         metadata_bundle = extract_repository_metadata(
             repo_root=repo_root,
@@ -832,7 +987,8 @@ async def main() -> None:
             extractor_project=ROSLYN_EXTRACTOR_DIR,
             timeout_seconds=args.roslyn_timeout,
         )
-        metadata_status = str(metadata_bundle.get("metadata_extraction_status") or "none")
+        metadata_status = str(metadata_bundle.get(
+            "metadata_extraction_status") or "none")
 
         _print_scope(
             repository_name=repository_name,
@@ -847,6 +1003,9 @@ async def main() -> None:
             max_concurrency=args.max_concurrency,
             max_requests_per_minute=args.max_requests_per_minute,
             max_rate_limit_retries=args.max_rate_limit_retries,
+            provider=model_config.provider,
+            model=model,
+            base_url=model_config.base_url,
             output=args.output,
         )
 
@@ -888,7 +1047,8 @@ async def main() -> None:
 
             if args.resume and state_manager is not None:
                 for feedback in batch_feedbacks:
-                    relative_path = _normalize_relative_path(feedback.relative_path)
+                    relative_path = _normalize_relative_path(
+                        feedback.relative_path)
                     checkpoint_completed[relative_path] = feedback
                     pending_paths.pop(relative_path, None)
 
@@ -898,9 +1058,11 @@ async def main() -> None:
                     pending_paths=sorted(pending_paths.keys()),
                 )
 
-        print(f"\nAggregating findings from {len(all_file_feedbacks)} files...")
+        print(
+            f"\nAggregating findings from {len(all_file_feedbacks)} files...")
 
-        merged_feedbacks = ResultsAggregator.merge_feedbacks(all_file_feedbacks)
+        merged_feedbacks = ResultsAggregator.merge_feedbacks(
+            all_file_feedbacks)
         report = ResultsAggregator.aggregate_findings(merged_feedbacks)
         report.repository_name = repository_name
         report.analyzed_at = datetime.now().isoformat()
@@ -914,6 +1076,9 @@ async def main() -> None:
             "max_concurrency": args.max_concurrency,
             "max_requests_per_minute": args.max_requests_per_minute,
             "max_rate_limit_retries": args.max_rate_limit_retries,
+            "provider": model_config.provider,
+            "model": model,
+            "base_url": model_config.base_url,
             "hot_path_only": not args.no_hot_path_only,
             "branch": args.branch,
             "cache_dir": str(state_manager.cache_dir) if state_manager is not None else None,
@@ -955,7 +1120,8 @@ async def main() -> None:
             try:
                 await client.close()
             except Exception as exc:  # noqa: BLE001
-                logger.warning("Failed to close AsyncOpenAI client cleanly: %s", exc)
+                logger.warning(
+                    "Failed to close AsyncOpenAI client cleanly: %s", exc)
 
         if temp_context is not None:
             temp_context.cleanup()

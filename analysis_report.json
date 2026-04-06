@@ -1,7 +1,7 @@
 {
   "schema_version": 2,
   "repository_name": "ConsoleApp2",
-  "analyzed_at": "2026-04-05T18:56:28.768063",
+  "analyzed_at": "2026-04-06T08:45:06.100516",
   "scope": {
     "repository": "ConsoleApp2",
     "root": "C:\\Users\\Ruben.Dario\\Documents\\GitHub\\tests\\ConsoleApp2",
@@ -12,13 +12,16 @@
     "max_concurrency": 2,
     "max_requests_per_minute": 12,
     "max_rate_limit_retries": 3,
+    "provider": "ollama",
+    "model": "gemma4",
+    "base_url": "http://localhost:11434/v1",
     "hot_path_only": true,
     "branch": "main",
     "cache_dir": "C:\\Users\\Ruben.Dario\\Documents\\GitHub\\tests\\ConsoleApp2\\.sg_cache",
     "resume_enabled": false,
     "metadata_extraction_status": "roslyn",
     "metadata_errors": [],
-    "config_signature": "67fbbc84785598a1ebda33d2c09e23aa4d8a2c174477f3b7a1438a672f07bc84"
+    "config_signature": "15a6d56d9d320e3a3246c3cbe0a03fa3497b87bc89c9830f5f62b15d6dddd70f"
   },
   "summary_metrics": {
     "total_files_analyzed": 3,
@@ -33,10 +36,10 @@
     "expert_activation": {},
     "files_with_critical": 0,
     "files_with_no_findings": 3,
-    "cache_hits": 3,
+    "cache_hits": 0,
     "resumed_count": 0,
-    "files_analyzed_fresh": 0,
-    "files_reused": 3
+    "files_analyzed_fresh": 3,
+    "files_reused": 0
   },
   "file_feedbacks": [
     {

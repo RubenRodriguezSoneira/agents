@@ -30,7 +30,12 @@ pip install -r requirements.txt
 Environment variables:
 
 - GITHUB_TOKEN: required for non-dry model runs.
-- GITHUB_MODEL: optional, default gpt-4.1.
+- MODEL_PROVIDER: optional, github (default) or ollama.
+- GITHUB_MODEL: optional, default gpt-4.1 when provider=github.
+- OLLAMA_MODEL: optional, default qwen3-coder-next when provider=ollama.
+- OLLAMA_BASE_URL: optional, default http://localhost:11434/v1.
+- OLLAMA_API_KEY: optional for Ollama OpenAI-compatible endpoints (default: ollama).
+- If OLLAMA_BASE_URL is set without /v1 (for example http://localhost:11434), the script auto-normalizes it to /v1.
 
 ### Quick Start
 
@@ -58,6 +63,12 @@ python scatter_gather_poc.py --repo dotnet/runtime --max-files 10
 python scatter_gather_poc.py --local C:\path\to\repo --resume
 ```
 
+5. Use Ollama with Qwen3-Coder-Next:
+
+```bash
+python scatter_gather_poc.py --local C:\path\to\repo --provider ollama --model qwen3-coder-next
+```
+
 ### CLI Flags
 
 ```text
@@ -72,13 +83,28 @@ python scatter_gather_poc.py --local C:\path\to\repo --resume
 --max-tokens-per-batch N             Token-cap batching (chars/4 estimate)
 --max-concurrency N                  Max concurrent model requests (default: 2)
 --max-requests-per-minute N          Global pacing limit for model requests (default: 12)
---max-retries N                      OpenAI client internal retry attempts (default: 5)
+--max-retries N                      Model client internal retry attempts (default: 5)
+--provider {github,ollama}           Model provider (default: MODEL_PROVIDER env or github)
+--model MODEL                        Model name override for selected provider
+--ollama-base-url URL                Ollama endpoint (default: OLLAMA_BASE_URL or http://localhost:11434/v1; /v1 auto-added if missing)
 --max-rate-limit-retries N           Additional retries after HTTP 429 (default: 3)
 --cache-dir PATH                     State/checkpoint directory (default: .sg_cache)
 --resume                             Resume from checkpoint
 --dry-run                            Show projected batches and calls only
 --roslyn-timeout SECONDS             Roslyn metadata timeout (default: 300)
 ```
+
+Notes:
+
+- Provider github uses GITHUB_TOKEN and GitHub Models endpoint.
+- Provider ollama does not require GITHUB_TOKEN for model calls.
+- Repository cloning with --repo may still need a GitHub token for private repositories.
+
+Ollama troubleshooting:
+
+- If you see model not found errors, the selected model is not installed locally in Ollama.
+- Set --model to an installed model ID, or pull the model before running.
+- The script now performs a startup check against /v1/models and fails early with available model IDs.
 
 ### Rate Limiting & Concurrency
 
